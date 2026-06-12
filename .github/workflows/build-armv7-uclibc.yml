@@ -1,0 +1,345 @@
+name: Build sshpass for ARMv7 uClibc (Rockchip)
+
+on:
+  push:
+    branches: [release]
+    paths-ignore:
+      - '**.md'
+      - '.gitignore'
+  workflow_dispatch:
+    inputs:
+      tag_suffix:
+        description: 'Release tag suffix (e.g. armv7l-uclibc)'
+        required: true
+        default: 'armv7l-uclibc'
+      release_name:
+        description: 'Release display name'
+        required: false
+        default: 'sshpass 1.10 — ARMv7 Cortex-A7 uClibc'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-24.04
+    name: Cross-compile sshpass for ARMv7 uClibc
+
+    env:
+      # ── Bootlin ARMv7 uClibc cross-compilation toolchain ──
+      # Toolchain:   armv7-eabihf (ARMv7, hard-float ABI)
+      # C library:   uClibc (compatible with uClibc 1.0.31 on target)
+      # Download URL: https://toolchains.bootlin.com/
+      TC_VERSION:   "2023.11-1"
+      TC_ARCH:      "armv7-eabihf"
+      TC_LIBC:      "uclibc"
+      CROSS_PREFIX: "arm-buildroot-linux-uclibcgnueabihf"
+      VERSION_BASE: "1.10"
+
+    steps:
+      # ================================================================
+      # Step 1 — Checkout source code
+      # ================================================================
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ================================================================
+      # Step 2 — Install ARMv7 uClibc cross-compilation toolchain
+      #          Source: Bootlin (toolchains.bootlin.com)
+      # ================================================================
+      - name: Download and install ARMv7 uClibc toolchain
+        run: |
+          TC_NAME="${TC_ARCH}--${TC_LIBC}--stable-${TC_VERSION}"
+          TC_URL="https://toolchains.bootlin.com/downloads/releases/toolchains/${TC_ARCH}/tarballs/${TC_NAME}.tar.bz2"
+
+          echo "::group::Downloading Bootlin toolchain"
+          echo "Toolchain: ${TC_NAME}"
+          echo "URL:       ${TC_URL}"
+          curl -fsSL --retry 3 --retry-delay 10 \
+            "${TC_URL}" \
+            -o /tmp/toolchain.tar.bz2
+          ls -lh /tmp/toolchain.tar.bz2
+          echo "::endgroup::"
+
+          echo "::group::Extracting to /opt"
+          sudo tar -xjf /tmp/toolchain.tar.bz2 -C /opt
+          rm /tmp/toolchain.tar.bz2
+          echo "::endgroup::"
+
+          TC_DIR="/opt/${TC_NAME}"
+          echo "TC_DIR=${TC_DIR}" >> $GITHUB_ENV
+          echo "${TC_DIR}/bin" >> $GITHUB_PATH
+
+          echo "::group::Compiler version"
+          "${TC_DIR}/bin/${CROSS_PREFIX}-gcc" --version
+          echo "::endgroup::"
+
+          echo "::group::Toolchain sysroot"
+          ls "${TC_DIR}/${CROSS_PREFIX}/sysroot/lib/"*.so* 2>/dev/null || true
+          echo "::endgroup::"
+
+      # ================================================================
+      # Step 3 — Cross-compile sshpass (static + dynamic variants)
+      #          Targeting: ARMv7-A, Cortex-A7, NEON/VFPv4, hard-float
+      # ================================================================
+      - name: Cross-compile sshpass (static)
+        run: |
+          export PATH="${TC_DIR}/bin:${PATH}"
+          export CC="${CROSS_PREFIX}-gcc"
+          export STRIP="${CROSS_PREFIX}-strip"
+          export READELF="${CROSS_PREFIX}-readelf"
+
+          # Compiler flags for the target embedded device:
+          #   march=armv7-a     → ARMv7-A instruction set
+          #   mtune=cortex-a7   → Optimize for Cortex-A7 pipeline (part 0xc07)
+          #   mfpu=neon-vfpv4   → NEON SIMD + VFPv4 floating-point
+          #   mfloat-abi=hard   → Hard-float ABI (FPU register passing)
+          #   mthumb            → Thumb-2 instruction set (smaller code)
+          #   -static           → No runtime libc dependency
+          #   -Os               → Optimize for size
+          export CFLAGS="-static -Os \
+            -march=armv7-a \
+            -mtune=cortex-a7 \
+            -mfpu=neon-vfpv4 \
+            -mfloat-abi=hard \
+            -mthumb"
+
+          echo "::group::Running configure"
+          ./configure \
+            --host="${CROSS_PREFIX}" \
+            --prefix=/usr \
+            --disable-shared \
+            --enable-static
+          echo "::endgroup::"
+
+          echo "::group::Compiling (static)"
+          make clean 2>/dev/null || true
+          make -j$(nproc) V=1
+          echo "::endgroup::"
+
+          echo "::group::Stripping"
+          ${CROSS_PREFIX}-strip -s sshpass
+          ls -lh sshpass
+          echo "::endgroup::"
+
+          cp sshpass sshpass-static
+
+      - name: Cross-compile sshpass (dynamic)
+        run: |
+          export PATH="${TC_DIR}/bin:${PATH}"
+          export CC="${CROSS_PREFIX}-gcc"
+          export STRIP="${CROSS_PREFIX}-strip"
+
+          # Dynamic build — linked against uClibc on target device
+          export CFLAGS="-Os \
+            -march=armv7-a \
+            -mtune=cortex-a7 \
+            -mfpu=neon-vfpv4 \
+            -mfloat-abi=hard \
+            -mthumb"
+
+          echo "::group::Running configure (dynamic)"
+          make clean 2>/dev/null || true
+          ./configure \
+            --host="${CROSS_PREFIX}" \
+            --prefix=/usr
+          echo "::endgroup::"
+
+          echo "::group::Compiling (dynamic)"
+          make -j$(nproc) V=1
+          echo "::endgroup::"
+
+          echo "::group::Stripping"
+          ${CROSS_PREFIX}-strip -s sshpass
+          mv sshpass sshpass-dynamic
+          ls -lh sshpass-dynamic
+          echo "::endgroup::"
+
+      # ================================================================
+      # Step 4 — Verify compiled binaries
+      # ================================================================
+      - name: Verify binary architecture
+        run: |
+          export PATH="${TC_DIR}/bin:${PATH}"
+
+          echo "::group::file(1) output"
+          echo "--- sshpass-static ---"
+          file sshpass-static
+          echo ""
+          echo "--- sshpass-dynamic ---"
+          file sshpass-dynamic
+          echo "::endgroup::"
+
+          echo "::group::ELF header (readelf -h)"
+          echo "--- sshpass-static ---"
+          ${CROSS_PREFIX}-readelf -h sshpass-static | grep -E "Class|Machine|OS|Entry|Flags"
+          echo ""
+          echo "--- sshpass-dynamic ---"
+          ${CROSS_PREFIX}-readelf -h sshpass-dynamic | grep -E "Class|Machine|OS|Entry|Flags"
+          echo "::endgroup::"
+
+          echo "::group::Required shared libraries (dynamic)"
+          ${CROSS_PREFIX}-readelf -d sshpass-dynamic 2>/dev/null | grep NEEDED || echo "(none)"
+          echo "::endgroup::"
+
+          echo "::group::Binary size comparison"
+          echo "  sshpass-static:   $(wc -c < sshpass-static) bytes"
+          echo "  sshpass-dynamic:  $(wc -c < sshpass-dynamic) bytes"
+          echo "::endgroup::"
+
+      # ================================================================
+      # Step 5 — Generate checksums
+      # ================================================================
+      - name: Generate checksums
+        run: |
+          sha256sum sshpass-static sshpass-dynamic > checksums.sha256
+          cat checksums.sha256
+
+      # ================================================================
+      # Step 6 — Determine tag name
+      # ================================================================
+      - name: Set release metadata
+        id: release
+        run: |
+          SUFFIX="${{ github.event.inputs.tag_suffix || 'armv7l-uclibc' }}"
+          TAG="${VERSION_BASE}-${SUFFIX}"
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "Release tag: ${TAG}"
+
+          RNAME="${{ github.event.inputs.release_name || 'sshpass 1.10 — ARMv7 Cortex-A7 uClibc' }}"
+          echo "name=${RNAME}" >> $GITHUB_OUTPUT
+
+      # ================================================================
+      # Step 7 — Remove existing tag if any (allow re-release)
+      # ================================================================
+      - name: Prepare for re-release
+        run: |
+          TAG="${{ steps.release.outputs.tag }}"
+          # Delete remote tag if it exists (don't fail if it doesn't)
+          git push origin ":refs/tags/${TAG}" 2>/dev/null || true
+          # Delete local tag if it exists
+          git tag -d "${TAG}" 2>/dev/null || true
+
+      # ================================================================
+      # Step 8 — Generate dynamic release body
+      # ================================================================
+      - name: Generate release notes
+        run: |
+          cat > /tmp/release-body.md << 'RELEASE_EOF'
+          # sshpass 1.10 — ARMv7 uClibc (Cortex-A7 / Rockchip)
+
+          ## 🎯 目标平台 / Target Platform
+
+          | 项目 | 详情 |
+          |------|------|
+          | **架构 / Arch** | `armv7l` (ARMv7-A 32-bit, little-endian) |
+          | **CPU 型号** | ARM Cortex-A7 rev 5 (part `0xc07`) |
+          | **SoC 平台** | Rockchip — Linux 5.10.160 |
+          | **C 运行库** | **uClibc 1.0.31** (`ld-uClibc-1.0.31.so`) |
+          | **浮点 ABI** | **Hard-float** (VFPv3, VFPv4, NEON SIMD) |
+          | **指令集** | ARMv7-A + Thumb-2 |
+          | **内核** | `Linux Rockchip 5.10.160 #1 armv7l GNU/Linux` |
+
+          | CPU Features | `half thumb fastmult vfp edsp neon vfpv3 tls vfpv4 idiva idivt vfpd32 lpae` |
+          |---|---|
+
+          ## 🔧 构建信息 / Build Information
+
+          | 项目 | 详情 |
+          |------|------|
+          | **编译器** | `arm-buildroot-linux-uclibcgnueabihf-gcc` (GCC, Bootlin 2023.11-1) |
+          | **C 库链接** | uClibc (sysroot from Bootlin toolchain) |
+          | **架构参数** | `-march=armv7-a -mtune=cortex-a7` |
+          | **FPU 参数** | `-mfpu=neon-vfpv4 -mfloat-abi=hard -mthumb` |
+          | **优化级别** | `-Os` (优化体积) |
+          | **CI 平台** | GitHub Actions — `ubuntu-24.04` |
+
+          ## 📦 产物文件 / Release Assets
+
+          | 文件名 | 链接方式 | 大小 | 说明 |
+          |--------|----------|------|------|
+          | **`sshpass-static`** | 静态链接 (uClibc) | 见下方 | ✅ 推荐 — 无运行时依赖，直接执行 |
+          | **`sshpass-dynamic`** | 动态链接 (uClibc) | 见下方 | 依赖目标设备 `/lib/ld-uClibc.so.1` |
+
+          ## 🚀 在目标设备上部署 / Quick Start
+
+          ```bash
+          # 1. 下载并推送到设备
+          scp sshpass-static root@<device-ip>:/usr/bin/sshpass
+
+          # 2. 在设备上赋予执行权限
+          chmod +x /usr/bin/sshpass
+
+          # 3. 验证
+          sshpass -V
+
+          # 4. 使用示例
+          sshpass -p 'password' ssh user@remote 'ls -la'
+          sshpass -f /path/to/password_file ssh user@remote
+          sshpass -e ssh user@remote   # 从 $SSHPASS 环境变量读取密码
+          ```
+
+          > **推荐使用 `sshpass-static`**：静态链接版本已将所有依赖（包括 uClibc）编译进二进制文件，无需目标设备安装任何额外的共享库。
+
+          ## 📋 目标设备完整环境快照
+
+          ```
+          内核版本 (uname -a):
+          Linux Rockchip 5.10.160 #1 Tue Apr 14 06:40:22 UTC 2026 armv7l GNU/Linux
+
+          机器架构 (uname -m):
+          armv7l
+
+          CPU 信息:
+          processor       : 0
+          model name      : ARMv7 Processor rev 5 (v7l)
+          Features        : half thumb fastmult vfp edsp neon vfpv3 tls vfpv4 idiva idivt vfpd32 lpae
+          CPU architecture: 7
+          CPU part        : 0xc07
+
+          链接器:
+          /lib/ld-uClibc.so.1 -> ld-uClibc-1.0.31.so (uClibc 1.0.31)
+          ```
+
+          ---
+
+          ## 🔐 校验和 / Checksums (SHA-256)
+
+          ```
+          RELEASE_EOF
+
+          # Append actual checksums
+          cat checksums.sha256 >> /tmp/release-body.md
+
+          cat >> /tmp/release-body.md << 'RELEASE_EOF'
+          ```
+
+          ---
+
+          > 🤖 由 GitHub Actions 自动构建发布
+          >   源码: [sshpass-1.10](https://sourceforge.net/projects/sshpass/)
+          RELEASE_EOF
+
+          echo "Generated release notes:"
+          cat /tmp/release-body.md
+
+      # ================================================================
+      # Step 9 — Create GitHub Release
+      # ================================================================
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release.outputs.tag }}
+          name: ${{ steps.release.outputs.name }}
+          body_path: /tmp/release-body.md
+          files: |
+            sshpass-static
+            sshpass-dynamic
+            checksums.sha256
+          draft: false
+          prerelease: false
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
