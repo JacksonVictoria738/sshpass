@@ -26,10 +26,6 @@ jobs:
     name: Cross-compile sshpass for ARMv7 uClibc
 
     env:
-      # ── Bootlin ARMv7 uClibc cross-compilation toolchain ──
-      # Toolchain:   armv7-eabihf (ARMv7, hard-float ABI)
-      # C library:   uClibc (compatible with uClibc 1.0.31 on target)
-      # Download URL: https://toolchains.bootlin.com/
       TC_VERSION:   "2023.11-1"
       TC_ARCH:      "armv7-eabihf"
       TC_LIBC:      "uclibc"
@@ -38,7 +34,7 @@ jobs:
 
     steps:
       # ================================================================
-      # Step 1 — Checkout source code
+      # Step 1 — Checkout
       # ================================================================
       - name: Checkout source
         uses: actions/checkout@v4
@@ -48,11 +44,16 @@ jobs:
       # ================================================================
       # Step 2 — Install ARMv7 uClibc cross-compilation toolchain
       #          Source: Bootlin (toolchains.bootlin.com)
+      #          CRITICAL: Do NOT add toolchain bin/ to global PATH —
+      #          its bundled autotools (aclocal-1.16, etc.) are broken
+      #          on the host system. Only use explicit CC/AR/RANLIB/STRIP.
       # ================================================================
       - name: Download and install ARMv7 uClibc toolchain
+        id: toolchain
         run: |
           TC_NAME="${TC_ARCH}--${TC_LIBC}--stable-${TC_VERSION}"
           TC_URL="https://toolchains.bootlin.com/downloads/releases/toolchains/${TC_ARCH}/tarballs/${TC_NAME}.tar.bz2"
+          TC_DIR="/opt/${TC_NAME}"
 
           echo "::group::Downloading Bootlin toolchain"
           echo "Toolchain: ${TC_NAME}"
@@ -66,37 +67,61 @@ jobs:
           echo "::group::Extracting to /opt"
           sudo tar -xjf /tmp/toolchain.tar.bz2 -C /opt
           rm /tmp/toolchain.tar.bz2
+          ls -d "${TC_DIR}"
           echo "::endgroup::"
-
-          TC_DIR="/opt/${TC_NAME}"
-          echo "TC_DIR=${TC_DIR}" >> $GITHUB_ENV
-          echo "${TC_DIR}/bin" >> $GITHUB_PATH
 
           echo "::group::Compiler version"
           "${TC_DIR}/bin/${CROSS_PREFIX}-gcc" --version
           echo "::endgroup::"
 
-          echo "::group::Toolchain sysroot"
+          echo "::group::Toolchain sysroot (verify uClibc)"
           ls "${TC_DIR}/${CROSS_PREFIX}/sysroot/lib/"*.so* 2>/dev/null || true
           echo "::endgroup::"
 
+          # Export for later steps (NOT via GITHUB_PATH — see note above)
+          echo "TC_DIR=${TC_DIR}" >> $GITHUB_OUTPUT
+
       # ================================================================
-      # Step 3 — Cross-compile sshpass (static + dynamic variants)
-      #          Targeting: ARMv7-A, Cortex-A7, NEON/VFPv4, hard-float
+      # Step 3 — Build: static variant (recommended)
       # ================================================================
       - name: Cross-compile sshpass (static)
         run: |
-          export PATH="${TC_DIR}/bin:${PATH}"
-          export CC="${CROSS_PREFIX}-gcc"
-          export STRIP="${CROSS_PREFIX}-strip"
-          export READELF="${CROSS_PREFIX}-readelf"
+          TC_DIR="${{ steps.toolchain.outputs.TC_DIR }}"
 
-          # Compiler flags for the target embedded device:
+          # Only expose the specific tools we need — NOT the entire bin/
+          export CC="${TC_DIR}/bin/${CROSS_PREFIX}-gcc"
+          export AR="${TC_DIR}/bin/${CROSS_PREFIX}-ar"
+          export RANLIB="${TC_DIR}/bin/${CROSS_PREFIX}-ranlib"
+          export STRIP="${TC_DIR}/bin/${CROSS_PREFIX}-strip"
+          export LD="${TC_DIR}/bin/${CROSS_PREFIX}-ld"
+
+          # ──────────────────────────────────────────────────────────
+          # PREVENT autotools auto-regeneration:
+          #   Git checkout sets all timestamps to NOW, which makes
+          #   make think .ac/.am files are newer than generated files.
+          #   The toolchain's autotools are broken on the host, and
+          #   we don't want autotools to run at all — we use the
+          #   configure script as-is.
+          # ──────────────────────────────────────────────────────────
+          touch aclocal.m4 configure Makefile.in config.h.in
+          chmod +x configure
+
+          # Disable the "missing" helper — if any autotool is missing,
+          # just warn and continue instead of failing.
+          export AUTOCONF=true
+          export AUTOMAKE=true
+          export ACLOCAL=true
+          export AUTOHEADER=true
+          export AUTOM4TE=true
+          export AUTOPOINT=true
+          export MAKEINFO=true
+
+          # Compiler flags targeting the embedded device:
           #   march=armv7-a     → ARMv7-A instruction set
-          #   mtune=cortex-a7   → Optimize for Cortex-A7 pipeline (part 0xc07)
-          #   mfpu=neon-vfpv4   → NEON SIMD + VFPv4 floating-point
-          #   mfloat-abi=hard   → Hard-float ABI (FPU register passing)
-          #   mthumb            → Thumb-2 instruction set (smaller code)
+          #   mtune=cortex-a7   → Cortex-A7 pipeline (CPU part 0xc07)
+          #   mfpu=neon-vfpv4   → NEON SIMD + VFPv4 FPU
+          #   mfloat-abi=hard   → Hard-float ABI (matches device)
+          #   mthumb            → Thumb-2 for smaller code
           #   -static           → No runtime libc dependency
           #   -Os               → Optimize for size
           export CFLAGS="-static -Os \
@@ -106,8 +131,9 @@ jobs:
             -mfloat-abi=hard \
             -mthumb"
 
-          echo "::group::Running configure"
-          chmod +x configure
+          export LDFLAGS="-static"
+
+          echo "::group::Running configure (static)"
           ./configure \
             --host="${CROSS_PREFIX}" \
             --prefix=/usr \
@@ -116,24 +142,35 @@ jobs:
           echo "::endgroup::"
 
           echo "::group::Compiling (static)"
-          make clean 2>/dev/null || true
           make -j$(nproc) V=1
           echo "::endgroup::"
 
-          echo "::group::Stripping"
-          ${CROSS_PREFIX}-strip -s sshpass
+          echo "::group::Stripping debug symbols"
+          ${STRIP} -s sshpass
           ls -lh sshpass
           echo "::endgroup::"
 
           cp sshpass sshpass-static
 
+      # ================================================================
+      # Step 4 — Build: dynamic variant (smaller, needs uClibc on target)
+      # ================================================================
       - name: Cross-compile sshpass (dynamic)
         run: |
-          export PATH="${TC_DIR}/bin:${PATH}"
-          export CC="${CROSS_PREFIX}-gcc"
-          export STRIP="${CROSS_PREFIX}-strip"
+          TC_DIR="${{ steps.toolchain.outputs.TC_DIR }}"
 
-          # Dynamic build — linked against uClibc on target device
+          export CC="${TC_DIR}/bin/${CROSS_PREFIX}-gcc"
+          export AR="${TC_DIR}/bin/${CROSS_PREFIX}-ar"
+          export RANLIB="${TC_DIR}/bin/${CROSS_PREFIX}-ranlib"
+          export STRIP="${TC_DIR}/bin/${CROSS_PREFIX}-strip"
+          export LD="${TC_DIR}/bin/${CROSS_PREFIX}-ld"
+
+          # Prevent autotools regeneration (same as static step)
+          touch aclocal.m4 configure Makefile.in config.h.in
+          chmod +x configure
+          export AUTOCONF=true AUTOMAKE=true ACLOCAL=true AUTOHEADER=true
+          export AUTOM4TE=true AUTOPOINT=true MAKEINFO=true
+
           export CFLAGS="-Os \
             -march=armv7-a \
             -mtune=cortex-a7 \
@@ -142,8 +179,6 @@ jobs:
             -mthumb"
 
           echo "::group::Running configure (dynamic)"
-          make clean 2>/dev/null || true
-          chmod +x configure
           ./configure \
             --host="${CROSS_PREFIX}" \
             --prefix=/usr
@@ -153,20 +188,21 @@ jobs:
           make -j$(nproc) V=1
           echo "::endgroup::"
 
-          echo "::group::Stripping"
-          ${CROSS_PREFIX}-strip -s sshpass
+          echo "::group::Stripping debug symbols"
+          ${STRIP} -s sshpass
           mv sshpass sshpass-dynamic
           ls -lh sshpass-dynamic
           echo "::endgroup::"
 
       # ================================================================
-      # Step 4 — Verify compiled binaries
+      # Step 5 — Verify compiled binaries
       # ================================================================
       - name: Verify binary architecture
         run: |
-          export PATH="${TC_DIR}/bin:${PATH}"
+          TC_DIR="${{ steps.toolchain.outputs.TC_DIR }}"
+          READELF="${TC_DIR}/bin/${CROSS_PREFIX}-readelf"
 
-          echo "::group::file(1) output"
+          echo "::group::file(1) type detection"
           echo "--- sshpass-static ---"
           file sshpass-static
           echo ""
@@ -176,31 +212,37 @@ jobs:
 
           echo "::group::ELF header (readelf -h)"
           echo "--- sshpass-static ---"
-          ${CROSS_PREFIX}-readelf -h sshpass-static | grep -E "Class|Machine|OS|Entry|Flags"
+          ${READELF} -h sshpass-static | grep -E "Class|Machine|OS/ABI|Entry|Flags"
           echo ""
           echo "--- sshpass-dynamic ---"
-          ${CROSS_PREFIX}-readelf -h sshpass-dynamic | grep -E "Class|Machine|OS|Entry|Flags"
+          ${READELF} -h sshpass-dynamic | grep -E "Class|Machine|OS/ABI|Entry|Flags"
           echo "::endgroup::"
 
-          echo "::group::Required shared libraries (dynamic)"
-          ${CROSS_PREFIX}-readelf -d sshpass-dynamic 2>/dev/null | grep NEEDED || echo "(none)"
+          echo "::group::Dynamic section (verify static vs dynamic)"
+          echo "--- sshpass-static NEEDED libs ---"
+          ${READELF} -d sshpass-static 2>/dev/null | grep NEEDED || echo "(statically linked — no shared library dependencies)"
+          echo ""
+          echo "--- sshpass-dynamic NEEDED libs ---"
+          ${READELF} -d sshpass-dynamic 2>/dev/null | grep NEEDED || echo "(none)"
           echo "::endgroup::"
 
           echo "::group::Binary size comparison"
-          echo "  sshpass-static:   $(wc -c < sshpass-static) bytes"
-          echo "  sshpass-dynamic:  $(wc -c < sshpass-dynamic) bytes"
+          echo "  sshpass-static:   $(wc -c < sshpass-static) bytes ($(du -h sshpass-static | cut -f1))"
+          echo "  sshpass-dynamic:  $(wc -c < sshpass-dynamic) bytes ($(du -h sshpass-dynamic | cut -f1))"
           echo "::endgroup::"
 
       # ================================================================
-      # Step 5 — Generate checksums
+      # Step 6 — Generate checksums
       # ================================================================
-      - name: Generate checksums
+      - name: Generate SHA-256 checksums
         run: |
           sha256sum sshpass-static sshpass-dynamic > checksums.sha256
+          echo "::group::Checksums"
           cat checksums.sha256
+          echo "::endgroup::"
 
       # ================================================================
-      # Step 6 — Determine tag name
+      # Step 7 — Determine release tag
       # ================================================================
       - name: Set release metadata
         id: release
@@ -214,18 +256,16 @@ jobs:
           echo "name=${RNAME}" >> $GITHUB_OUTPUT
 
       # ================================================================
-      # Step 7 — Remove existing tag if any (allow re-release)
+      # Step 8 — Delete existing tag for re-release
       # ================================================================
       - name: Prepare for re-release
         run: |
           TAG="${{ steps.release.outputs.tag }}"
-          # Delete remote tag if it exists (don't fail if it doesn't)
           git push origin ":refs/tags/${TAG}" 2>/dev/null || true
-          # Delete local tag if it exists
           git tag -d "${TAG}" 2>/dev/null || true
 
       # ================================================================
-      # Step 8 — Generate dynamic release body
+      # Step 9 — Generate release notes
       # ================================================================
       - name: Generate release notes
         run: |
@@ -260,10 +300,11 @@ jobs:
 
           ## 📦 产物文件 / Release Assets
 
-          | 文件名 | 链接方式 | 大小 | 说明 |
-          |--------|----------|------|------|
-          | **`sshpass-static`** | 静态链接 (uClibc) | 见下方 | ✅ 推荐 — 无运行时依赖，直接执行 |
-          | **`sshpass-dynamic`** | 动态链接 (uClibc) | 见下方 | 依赖目标设备 `/lib/ld-uClibc.so.1` |
+          | 文件名 | 链接方式 | 说明 |
+          |--------|----------|------|
+          | **`sshpass-static`** | 静态链接 (uClibc) | ✅ **推荐** — 无运行时依赖，直接执行 |
+          | **`sshpass-dynamic`** | 动态链接 (uClibc) | 依赖目标设备 `/lib/ld-uClibc.so.1`，体积更小 |
+          | **`checksums.sha256`** | — | SHA-256 校验文件 |
 
           ## 🚀 在目标设备上部署 / Quick Start
 
@@ -283,7 +324,7 @@ jobs:
           sshpass -e ssh user@remote   # 从 $SSHPASS 环境变量读取密码
           ```
 
-          > **推荐使用 `sshpass-static`**：静态链接版本已将所有依赖（包括 uClibc）编译进二进制文件，无需目标设备安装任何额外的共享库。
+          > **推荐使用 `sshpass-static`**：静态链接版本已将 uClibc 编译进二进制文件，无需目标设备安装任何额外的共享库。
 
           ## 📋 目标设备完整环境快照
 
@@ -312,7 +353,6 @@ jobs:
           ```
           RELEASE_EOF
 
-          # Append actual checksums
           cat checksums.sha256 >> /tmp/release-body.md
 
           cat >> /tmp/release-body.md << 'RELEASE_EOF'
@@ -328,7 +368,7 @@ jobs:
           cat /tmp/release-body.md
 
       # ================================================================
-      # Step 9 — Create GitHub Release
+      # Step 10 — Create GitHub Release
       # ================================================================
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
