@@ -107,6 +107,7 @@ jobs:
             -mthumb"
 
           echo "::group::Running configure"
+          chmod +x configure
           ./configure \
             --host="${CROSS_PREFIX}" \
             --prefix=/usr \
@@ -142,6 +143,7 @@ jobs:
 
           echo "::group::Running configure (dynamic)"
           make clean 2>/dev/null || true
+          chmod +x configure
           ./configure \
             --host="${CROSS_PREFIX}" \
             --prefix=/usr
